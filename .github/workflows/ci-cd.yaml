@@ -9,19 +9,19 @@ on:
     branches:
       - main
 
-# Provide permissions for AWS OIDC (id-token) and repository checkout
+# Provide permissions required for AWS OIDC authentication (id-token) and repository checkout
 permissions:
   id-token: write
   contents: read
 
 env:
   AWS_REGION: "eu-central-1"
-  # ARN of the IAM role created in AWS for GitHub Actions (via OIDC)
+  # IAM Role ARN configured via bootstrap OIDC script
   AWS_ROLE_ARN: "arn:aws:iam::881839569883:role/github-actions-ecr-push-dev"
-  ECR_REPOSITORY: "k8s-node-app"
+  ECR_REPOSITORY: "dev-k8s-node-app"
 
 jobs:
-  # 1. Verification stage: Code and Helm chart linting
+  # 1. Validation stage: Lint application code and Helm chart
   lint:
     name: Lint & Validate
     runs-on: ubuntu-latest
@@ -48,35 +48,35 @@ jobs:
         run: |
           helm lint charts/k8s-node-app
 
-  # 2. Build and push stage to AWS ECR
+  # 2. Build stage: Build and push Docker image to AWS ECR
   build-and-push:
     name: Build & Push to ECR
     needs: lint
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' # Push only on actual
+    if: github.event_name == 'push' # Only trigger on actual branch pushes
 
     outputs:
-      image_tag: ${{ steps:set-tag.outputs.tag }}
+      image_tag: ${{ steps.set-tag.outputs.tag }}
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # For main, generate a tag based on the commit SHA (e.g., prod-a1b2c3d)
+      # Dynamically determine Docker image tag depending on the source branch
       - name: Set Image Tag
         id: set-tag
         run: |
           if [ "${{ github.ref_name }}" = "main" ]; then
-            # Для main генерируем тег на основе SHA коммита (например, prod-a1b2c3d)
+            # Generate a production tag based on commit SHA
             TAG="prod-${{ github.sha }}"
           else
-            # Для ветки dev или feature-веток
+            # Default tag for dev or feature branches
             TAG="dev-${{ github.sha }}"
           fi
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "Calculated Tag: $TAG"
 
-      # For dev or feature branches
+      # Securely authenticate with AWS using OIDC instead of static access keys
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -88,7 +88,7 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Secure authentication to AWS via OIDC without persistent credentials
+      # Enable Buildx for layer caching support
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -99,12 +99,12 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: |
-            ${{ steps:login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps:set-tag.outputs.tag }}
-            ${{ steps:login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.ref_name }}-latest
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.set-tag.outputs.tag }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.ref_name }}-latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # 3.  GitOps: update tag in Flux CD
+  # 3. GitOps stage: Update the image tag inside Flux CD manifests
   gitops-update:
     name: Update Flux GitOps Config
     needs: build-and-push
@@ -112,6 +112,8 @@ jobs:
     if: github.ref_name == 'main' || github.ref_name == 'dev'
 
     steps:
+      # Authenticate using a Personal Access Token (PAT) stored in GitHub Secrets
+      # Make sure to create GITHUB_TOKEN_PATCH under Settings -> Secrets -> Actions
       - name: Checkout GitOps Infra Repository
         uses: actions/checkout@v4
         with:
@@ -123,14 +125,14 @@ jobs:
         run: |
           TARGET_ENV="dev"
           if [ "${{ github.ref_name }}" = "main" ]; then
-            # if pushed to main, updating ctage. for prod will do manually
+            # If pushed to main, deploy automatically to stage env
             TARGET_ENV="stage"
           fi
           
           FILE_PATH="flux/apps/environments/${TARGET_ENV}/helm-release.yaml"
           NEW_TAG="${{ needs.build-and-push.outputs.image_tag }}"
           
-          # update tag in YAML with yq
+          # In-place YAML update using yq
           yq -i ".spec.values.image.tag = \"${NEW_TAG}\"" ${FILE_PATH}
           
           echo "Updated ${FILE_PATH} with tag ${NEW_TAG}"
