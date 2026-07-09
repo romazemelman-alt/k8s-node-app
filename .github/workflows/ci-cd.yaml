@@ -1,0 +1,145 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+
+# Provide permissions for AWS OIDC (id-token) and repository checkout
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: "eu-central-1"
+  # ARN of the IAM role created in AWS for GitHub Actions (via OIDC)
+  AWS_ROLE_ARN: "arn:aws:iam::881839569883:role/github-actions-ecr-push-dev"
+  ECR_REPOSITORY: "k8s-node-app"
+
+jobs:
+  # 1. Verification stage: Code and Helm chart linting
+  lint:
+    name: Lint & Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python Dependencies Lint
+        run: |
+          pip install flake8
+          # flake8 app/ --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.12.0'
+
+      - name: Helm Lint
+        run: |
+          helm lint charts/k8s-node-app
+
+  # 2. Build and push stage to AWS ECR
+  build-and-push:
+    name: Build & Push to ECR
+    needs: lint
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' # Push only on actual
+
+    outputs:
+      image_tag: ${{ steps:set-tag.outputs.tag }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # For main, generate a tag based on the commit SHA (e.g., prod-a1b2c3d)
+      - name: Set Image Tag
+        id: set-tag
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            # Для main генерируем тег на основе SHA коммита (например, prod-a1b2c3d)
+            TAG="prod-${{ github.sha }}"
+          else
+            # Для ветки dev или feature-веток
+            TAG="dev-${{ github.sha }}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Calculated Tag: $TAG"
+
+      # For dev or feature branches
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Secure authentication to AWS via OIDC without persistent credentials
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps:login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps:set-tag.outputs.tag }}
+            ${{ steps:login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.ref_name }}-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # 3.  GitOps: update tag in Flux CD
+  gitops-update:
+    name: Update Flux GitOps Config
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref_name == 'main' || github.ref_name == 'dev'
+
+    steps:
+      - name: Checkout GitOps Infra Repository
+        uses: actions/checkout@v4
+        with:
+          repository: 'romazemelman-alt/gitops-infra-platform'
+          token: ${{ secrets.GITHUB_TOKEN_PATCH }}
+          ref: 'main'
+
+      - name: Update Image Tag in HelmRelease
+        run: |
+          TARGET_ENV="dev"
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            # if pushed to main, updating ctage. for prod will do manually
+            TARGET_ENV="stage"
+          fi
+          
+          FILE_PATH="flux/apps/environments/${TARGET_ENV}/helm-release.yaml"
+          NEW_TAG="${{ needs.build-and-push.outputs.image_tag }}"
+          
+          # update tag in YAML with yq
+          yq -i ".spec.values.image.tag = \"${NEW_TAG}\"" ${FILE_PATH}
+          
+          echo "Updated ${FILE_PATH} with tag ${NEW_TAG}"
+
+      - name: Commit and Push Changes to Infra Repo
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add .
+          git commit -m "chore(gitops): automated image update to ${{ needs.build-and-push.outputs.image_tag }} [skip ci]"
+          git push origin main

@@ -1,0 +1,25 @@
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 2
+
+image:
+  repository: "881839569883.dkr.ecr.eu-central-1.amazonaws.com/k8s-node-app"
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: "k8s-node-app-sa"
+
+service:
+  type: ClusterIP
+  port: 80
+
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi

@@ -1,0 +1,24 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: k8s-node-app-ingress
+  annotations:
+    # create Application Load Balancer
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    # target-type: ip
+    alb.ingress.kubernetes.io/target-type: ip
+    #  ARN of TLS certificate from AWS ACM
+    # alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:eu-central-1:123456789:certificate/...
+    # alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS":443}]'
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dev-k8s-node-app
+                port:
+                  number: 80
