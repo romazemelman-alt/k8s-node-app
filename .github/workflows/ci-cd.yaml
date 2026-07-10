@@ -125,8 +125,8 @@ jobs:
         run: |
           TARGET_ENV="dev"
           if [ "${{ github.ref_name }}" = "main" ]; then
-            # If pushed to main, deploy automatically to stage env
-            TARGET_ENV="stage"
+            # If pushed to main, deploy automatically to stage staging
+            TARGET_ENV="staging"
           fi
           
           FILE_PATH="flux/apps/environments/${TARGET_ENV}/helm-release.yaml"
